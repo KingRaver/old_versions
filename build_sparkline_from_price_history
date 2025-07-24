@@ -1,0 +1,110 @@
+def build_sparkline_from_price_history(self, token: str, hours: int = 168) -> List[float]:
+        """
+        Build sparkline array from individual price history records
+        Fallback when no stored sparkline data is available
+        
+        FIXED: Corrected SQL parameter binding for hours in datetime function
+        
+        Args:
+            token: Token symbol
+            hours: Number of hours to look back
+        
+        Returns:
+            List of price points built from price history
+        """
+        try:
+            conn, cursor = self._get_connection()
+            
+            # ✅ FIXED: Use proper parameter substitution for hours in datetime calculation
+            # Calculate the target timestamp outside the SQL query
+            from datetime import datetime, timedelta
+            cutoff_time = datetime.now() - timedelta(hours=hours)
+            cutoff_timestamp = cutoff_time.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # ✅ ENHANCED: Add token normalization for consistent database lookups
+            normalized_token = self._normalize_token_for_database(token) if hasattr(self, '_normalize_token_for_database') else token.upper()
+            
+            logger.logger.debug(f"🔍 Querying price history for {normalized_token} since {cutoff_timestamp}")
+            
+            # ✅ CORRECTED SQL: Use simple parameter binding without string concatenation
+            cursor.execute("""
+                SELECT price, timestamp 
+                FROM price_history 
+                WHERE token = ? 
+                AND timestamp >= ?
+                ORDER BY timestamp ASC
+            """, (normalized_token, cutoff_timestamp))
+            
+            results = cursor.fetchall()
+            
+            # ✅ ENHANCED: Try alternative token formats if no results found
+            if not results and normalized_token != token:
+                logger.logger.debug(f"No results for {normalized_token}, trying original token {token}")
+                cursor.execute("""
+                    SELECT price, timestamp 
+                    FROM price_history 
+                    WHERE token = ? 
+                    AND timestamp >= ?
+                    ORDER BY timestamp ASC
+                """, (token, cutoff_timestamp))
+                
+                results = cursor.fetchall()
+            
+            # ✅ ENHANCED: Try uppercase version if still no results
+            if not results and token.upper() != normalized_token:
+                logger.logger.debug(f"No results for {token}, trying uppercase {token.upper()}")
+                cursor.execute("""
+                    SELECT price, timestamp 
+                    FROM price_history 
+                    WHERE token = ? 
+                    AND timestamp >= ?
+                    ORDER BY timestamp ASC
+                """, (token.upper(), cutoff_timestamp))
+                
+                results = cursor.fetchall()
+            
+            if not results:
+                logger.logger.debug(f"❌ No price history found for {token} to build sparkline (searched {normalized_token}, {token}, {token.upper()})")
+                # ✅ ENHANCED: Query database stats for debugging
+                cursor.execute("SELECT COUNT(*) as total_rows FROM price_history")
+                total_rows = cursor.fetchone()['total_rows'] if cursor.fetchone() else 0
+                
+                cursor.execute("SELECT DISTINCT token FROM price_history LIMIT 10")
+                available_tokens = [row['token'] for row in cursor.fetchall()]
+                
+                logger.logger.debug(f"📊 Database has {total_rows} total price history rows")
+                logger.logger.debug(f"📋 Available tokens (sample): {available_tokens}")
+                
+                return []
+            
+            # ✅ ENHANCED: Extract price array with error handling
+            price_array = []
+            for row in results:
+                try:
+                    price = float(row['price'])
+                    if price > 0:  # Validate price is positive
+                        price_array.append(price)
+                    else:
+                        logger.logger.warning(f"⚠️ Invalid price {price} for {token} - skipping")
+                except (ValueError, TypeError) as e:
+                    logger.logger.warning(f"⚠️ Error converting price to float for {token}: {e}")
+                    continue
+            
+            if price_array:
+                logger.logger.debug(f"✅ Built sparkline from price history for {token}: {len(price_array)} valid points")
+                
+                # ✅ ENHANCED: Log time range for debugging
+                if len(results) > 0:
+                    first_time = results[0]['timestamp']
+                    last_time = results[-1]['timestamp']
+                    logger.logger.debug(f"📅 Data range: {first_time} to {last_time}")
+            else:
+                logger.logger.warning(f"⚠️ No valid prices extracted from {len(results)} database rows for {token}")
+            
+            return price_array
+            
+        except Exception as e:
+            import traceback
+            logger.log_error(f"Build Sparkline from Price History - {token}", str(e))
+            logger.logger.error(f"❌ Exception details: {traceback.format_exc()}")
+            return []
