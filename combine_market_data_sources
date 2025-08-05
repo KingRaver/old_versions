@@ -1,0 +1,189 @@
+def combine_market_data_sources(self, hours: int = 24) -> bool:
+        """
+        Combine CoinGecko and CoinMarketCap data sources into unified market_data table
+        
+        Algorithm:
+        - CoinGecko takes precedence (more data points, equal quality)
+        - CoinMarketCap fills gaps where CoinGecko data missing
+        - Most recent timestamp + average for conflicts
+        - Graceful error handling with warning logs
+        - Preserves existing mapping/field structure
+        
+        Args:
+            hours: Number of hours of recent data to combine (default: 24)
+            
+        Returns:
+            Boolean indicating success/failure of combination operation
+        """
+        conn, cursor = self._get_connection()
+        
+        try:
+            current_time = datetime.now()
+            time_threshold = current_time - timedelta(hours=hours)
+            combined_count = 0
+            warning_count = 0
+            
+            logger.logger.info(f"🔄 Starting market data combination for last {hours} hours")
+            
+            # Get recent CoinGecko data (primary source)
+            cursor.execute("""
+                SELECT * FROM coingecko_market_data 
+                WHERE timestamp >= ? 
+                ORDER BY timestamp DESC
+            """, (time_threshold,))
+            coingecko_data = [dict(row) for row in cursor.fetchall()]
+            
+            # Get recent CoinMarketCap data (supplementary source)
+            cursor.execute("""
+                SELECT * FROM coinmarketcap_market_data 
+                WHERE timestamp >= ? 
+                ORDER BY timestamp DESC
+            """, (time_threshold,))
+            coinmarketcap_data = [dict(row) for row in cursor.fetchall()]
+            
+            # Create symbol-based lookup for CoinMarketCap data
+            cmc_by_symbol = {}
+            for item in coinmarketcap_data:
+                symbol = item.get('symbol', '').upper()
+                if symbol:
+                    # Keep most recent entry per symbol
+                    if symbol not in cmc_by_symbol or item['timestamp'] > cmc_by_symbol[symbol]['timestamp']:
+                        cmc_by_symbol[symbol] = item
+            
+            logger.logger.info(f"📊 Processing {len(coingecko_data)} CoinGecko entries, {len(coinmarketcap_data)} CoinMarketCap entries")
+            
+            # Process each CoinGecko entry (primary source)
+            for cg_item in coingecko_data:
+                try:
+                    # Helper function for safe field extraction with warnings
+                    def safe_combine_field(cg_value, cmc_value, field_name, prefer_recent=True):
+                        try:
+                            # If CoinGecko has data, use it (precedence)
+                            if cg_value is not None and cg_value != 0:
+                                return cg_value
+                            
+                            # Fall back to CoinMarketCap if CoinGecko missing
+                            if cmc_value is not None and cmc_value != 0:
+                                return cmc_value
+                            
+                            # Both missing - log warning
+                            nonlocal warning_count
+                            warning_count += 1
+                            logger.logger.warning(f"⚠️ Missing data for field '{field_name}' in both sources")
+                            return None
+                            
+                        except Exception:
+                            warning_count += 1
+                            logger.logger.warning(f"⚠️ Error combining field '{field_name}'")
+                            return cg_value  # Default to CoinGecko
+                    
+                    # Get corresponding CoinMarketCap data
+                    symbol = cg_item.get('symbol', '').upper()
+                    cmc_item = cmc_by_symbol.get(symbol, {})
+                    
+                    # Extract and combine core fields using existing market_data structure
+                    combined_entry = {
+                        'timestamp': current_time,
+                        'chain': symbol,  # Use symbol as chain identifier (existing format)
+                        'price': safe_combine_field(
+                            cg_item.get('current_price'), 
+                            cmc_item.get('quote_price'), 
+                            'price'
+                        ),
+                        'volume': safe_combine_field(
+                            cg_item.get('total_volume'), 
+                            cmc_item.get('quote_volume_24h'), 
+                            'volume'
+                        ),
+                        'price_change_24h': safe_combine_field(
+                            cg_item.get('price_change_percentage_24h'), 
+                            cmc_item.get('quote_percent_change_24h'), 
+                            'price_change_24h'
+                        ),
+                        'market_cap': safe_combine_field(
+                            cg_item.get('market_cap'), 
+                            cmc_item.get('quote_market_cap'), 
+                            'market_cap'
+                        ),
+                        'ath': safe_combine_field(
+                            cg_item.get('ath'), 
+                            None,  # CoinMarketCap doesn't have ATH in same format
+                            'ath'
+                        ),
+                        'ath_change_percentage': safe_combine_field(
+                            cg_item.get('ath_change_percentage'), 
+                            None,
+                            'ath_change_percentage'
+                        )
+                    }
+                    
+                    # Skip if no valid price data
+                    if not combined_entry['price'] or combined_entry['price'] <= 0:
+                        warning_count += 1
+                        logger.logger.warning(f"⚠️ Skipping {symbol} - no valid price data")
+                        continue
+                    
+                    # Insert into market_data table (preserving existing structure)
+                    cursor.execute("""
+                        INSERT INTO market_data (
+                            timestamp, chain, price, volume, price_change_24h, 
+                            market_cap, ath, ath_change_percentage
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        combined_entry['timestamp'],
+                        combined_entry['chain'],
+                        combined_entry['price'],
+                        combined_entry['volume'],
+                        combined_entry['price_change_24h'],
+                        combined_entry['market_cap'],
+                        combined_entry['ath'],
+                        combined_entry['ath_change_percentage']
+                    ))
+                    
+                    combined_count += 1
+                    
+                except Exception as item_error:
+                    warning_count += 1
+                    logger.logger.warning(f"⚠️ Failed to combine data for item: {str(item_error)}")
+                    continue
+            
+            # Handle tokens that exist only in CoinMarketCap
+            cg_symbols = {item.get('symbol', '').upper() for item in coingecko_data}
+            
+            for symbol, cmc_item in cmc_by_symbol.items():
+                if symbol not in cg_symbols:
+                    try:
+                        # CoinMarketCap-only token
+                        cursor.execute("""
+                            INSERT INTO market_data (
+                                timestamp, chain, price, volume, price_change_24h, market_cap
+                            ) VALUES (?, ?, ?, ?, ?, ?)
+                        """, (
+                            current_time,
+                            symbol,
+                            cmc_item.get('quote_price', 0),
+                            cmc_item.get('quote_volume_24h', 0),
+                            cmc_item.get('quote_percent_change_24h', 0),
+                            cmc_item.get('quote_market_cap', 0)
+                        ))
+                        
+                        combined_count += 1
+                        
+                    except Exception as cmc_error:
+                        warning_count += 1
+                        logger.logger.warning(f"⚠️ Failed to store CoinMarketCap-only data for {symbol}: {str(cmc_error)}")
+            
+            conn.commit()
+            
+            # Log results
+            logger.logger.info(f"✅ Market data combination complete: {combined_count} tokens stored")
+            if warning_count > 0:
+                logger.logger.warning(f"⚠️ Data combination warnings: {warning_count} issues encountered")
+            
+            return combined_count > 0
+            
+        except Exception as e:
+            logger.log_error("Combine Market Data Sources", str(e))
+            if conn:
+                conn.rollback()
+            return False
